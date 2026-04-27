@@ -1,0 +1,197 @@
+cat << 'EOF' > TEST04.py
+#!/usr/bin/env python3
+"""
+TEST04.py: PhantomX Pincher 完整最終版控制腳本
+整合環境碰撞、垂直朝上安全預備姿態、以及 CM-530 硬體通訊協定
+"""
+
+import time
+import math
+import serial
+import rclpy
+import std_msgs.msg
+import geometry_msgs.msg
+import tf2_ros
+import moveit_msgs.msg
+import trajectory_msgs.msg
+
+from copy import deepcopy
+from math import pi
+from threading import Thread
+from typing import Tuple, List
+
+from pymoveit2 import MoveIt2
+from pymoveit2.robots import phantomx_pincher
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.node import Node
+
+# --- 硬體與通訊規格設定 ---
+SERIAL_PORT = '/dev/ttyUSB0'  
+BAUD_RATE = 57600             
+AX_SCALE = 195.3786           
+
+JOINT_CONFIGS = [
+    {"name": "waist",       "center": 512, "sign": 1,  "offset": 0}, # j1 -> ID17
+    {"name": "shoulder",    "center": 512, "sign": 1,  "offset": 0}, # j2 -> ID3
+    {"name": "elbow",       "center": 512, "sign": 1,  "offset": 0}, # j3 -> ID2
+    {"name": "wrist_flex",  "center": 512, "sign": 1,  "offset": 0}  # j4 -> ID7
+]
+
+# --- 環境碰撞箱設定 ---
+MODULE_COVER_SIZE = (0.148, 0.148, 0.003)
+MODULE_COVER_POSE = geometry_msgs.msg.PoseStamped(
+    header=std_msgs.msg.Header(frame_id="phantomx_pincher_task_board_module_link"),
+    pose=geometry_msgs.msg.Pose(
+        position=geometry_msgs.msg.Point(x=0.0, y=0.0, z=MODULE_COVER_SIZE[2] / 2.0),
+        orientation=geometry_msgs.msg.Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+    ),
+)
+
+OBJECT_SIZE = (0.015,) * 3
+INITIAL_OBJECT_POSE = geometry_msgs.msg.PoseStamped(
+    header=std_msgs.msg.Header(frame_id="phantomx_pincher_task_board_module_link"),
+    pose=geometry_msgs.msg.Pose(
+        position=geometry_msgs.msg.Point(x=0.0, y=0.0, z=MODULE_COVER_SIZE[2] + OBJECT_SIZE[2] / 2.0 + 0.005),
+        orientation=geometry_msgs.msg.Quaternion(x=1.0, y=0.0, z=0.0, w=0.0),
+    ),
+)
+
+class CM530Interface:
+    def __init__(self, port, baudrate):
+        try:
+            self.ser = serial.Serial(port, baudrate, timeout=2.0)
+            print(f"✅ Serial Port {port} 已開啟。")
+        except Exception as e:
+            print(f"⚠️ 無法開啟 Serial Port: {e} (將僅在終端模擬)")
+            self.ser = None
+
+    def send_and_wait_ack(self, cmd: str, ack_keyword: str) -> bool:
+        if not self.ser:
+            print(f"[SIMULATE] >> {cmd}")
+            return True
+        self.ser.write((cmd + "\n").encode('ascii'))
+        print(f">> [TX]: {cmd}")
+        start_time = time.time()
+        while (time.time() - start_time) < 3.0:
+            if self.ser.in_waiting:
+                line = self.ser.readline().decode('ascii').strip()
+                print(f"<< [RX]: {line}")
+                if ack_keyword in line:
+                    return True
+        return False
+
+def rad_to_ax(rad: float, config: dict) -> int:
+    pos = int(round(config["center"] + config["sign"] * rad * AX_SCALE + config["offset"]))
+    return max(0, min(1023, pos))
+
+def main():
+    rclpy.init()
+    node = Node("demo_phantomx_full_control")
+    callback_group = ReentrantCallbackGroup()
+    cm530 = CM530Interface(SERIAL_PORT, BAUD_RATE)
+
+    moveit2 = MoveIt2(
+        node=node,
+        joint_names=phantomx_pincher.joint_names(),
+        base_link_name=phantomx_pincher.base_link_name(),
+        end_effector_name=phantomx_pincher.end_effector_name(),
+        group_name=phantomx_pincher.MOVE_GROUP_ARM,
+        callback_group=callback_group,
+        execute_via_moveit=True,
+    )
+    
+    planned_trajectories = []
+    def trajectory_callback(msg: moveit_msgs.msg.DisplayTrajectory):
+        if msg.trajectory:
+            planned_trajectories.append(msg.trajectory[0].joint_trajectory)
+
+    node.create_subscription(
+        moveit_msgs.msg.DisplayTrajectory,
+        '/display_planned_path',
+        trajectory_callback,
+        10,
+        callback_group=callback_group
+    )
+
+    executor = rclpy.executors.MultiThreadedExecutor(2)
+    executor.add_node(node)
+    executor_thread = Thread(target=executor.spin, daemon=True)
+    executor_thread.start()
+
+    moveit2.max_velocity = 0.5
+    moveit2.max_acceleration = 0.5
+
+    while rclpy.ok() and moveit2.joint_state is None:
+        time.sleep(1.0)
+
+    # 1. 設置規劃場景 (避障)
+    moveit2.add_collision_box("module_cover", pose=MODULE_COVER_POSE, size=MODULE_COVER_SIZE)
+    moveit2.add_collision_box("object", pose=INITIAL_OBJECT_POSE, size=OBJECT_SIZE)
+    
+    # 2. 移動到「垂直朝上」的安全預備位置
+    print("\n⏳ 正在移動至垂直朝上的安全預備位置 (0.0, 0.0, 0.0, 0.0)...")
+    moveit2.move_to_configuration(joint_positions=[0.0, 0.0, 0.0, 0.0])
+    moveit2.wait_until_executed()
+    
+    print("\n✅ 系統就緒，手臂已到達安全位置。")
+
+    # 3. 進入手動座標輸入迴圈
+    while rclpy.ok():
+        print("\n" + "="*50)
+        print("【手動輸入模式】 輸入目標座標 X Y Z (或輸入 q 結束)")
+        user_input = input(">> ")
+        
+        if user_input.strip().lower() == 'q': break
+        
+        try:
+            target_vals = [float(v) for v in user_input.split()]
+            if len(target_vals) != 3: raise ValueError
+        except ValueError:
+            print("❌ 格式錯誤，請輸入例如: 0.15 0.0 0.15")
+            continue
+
+        target_pose = geometry_msgs.msg.PoseStamped()
+        target_pose.header.frame_id = phantomx_pincher.base_link_name()
+        target_pose.pose.position.x, target_pose.pose.position.y, target_pose.pose.position.z = target_vals
+        target_pose.pose.orientation = geometry_msgs.msg.Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
+
+        planned_trajectories.clear()
+        print(f"⏳ 正在規劃至: {target_vals}...")
+        moveit2.move_to_pose(target_pose)
+        moveit2.wait_until_executed()
+
+        if planned_trajectories:
+            print("✅ 規劃成功，開始傳輸至 CM-530...")
+            transmit_to_hardware(cm530, planned_trajectories[-1])
+        else:
+            print("❌ 規劃失敗，可能超出工作範圍。")
+
+    rclpy.shutdown()
+    executor_thread.join()
+
+def transmit_to_hardware(interface: CM530Interface, trajectory: trajectory_msgs.msg.JointTrajectory):
+    traj_id = int(time.time()) % 255
+    point_count = len(trajectory.points)
+    joint_count = 4 
+
+    if not interface.send_and_wait_ack(f"BEGIN,{traj_id},{joint_count},{point_count}", "OK,BEGIN"):
+        return
+
+    prev_ms = 0.0
+    for seq, point in enumerate(trajectory.points):
+        curr_ms = (point.time_from_start.sec * 1000) + (point.time_from_start.nanosec / 1e6)
+        dt_ms = max(20, int(round(curr_ms - prev_ms))) 
+        prev_ms = curr_ms
+        ax_vals = [str(rad_to_ax(point.positions[i], JOINT_CONFIGS[i])) for i in range(joint_count)]
+        pt_cmd = f"PT,{seq},{dt_ms}," + ",".join(ax_vals)
+        if not interface.send_and_wait_ack(pt_cmd, "OK,PT"):
+            return
+
+    interface.send_and_wait_ack(f"END,{traj_id}", "OK,END")
+    print("🏁 實體手臂運動完成！")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+chmod +x TEST04.py
