@@ -1,0 +1,45 @@
+docker start mytest
+
+docker exec -it mytest bash
+
+ros2 launch phantomx_pincher fake.launch.py
+
+python3 TEST01.py
+
+python3 TEST04.py
+
+每次執行TEST05都要先
+source install/setup.bash
+
+python3 TEST05.py
+
+可測試座標
+0.15 0.0 0.03
+
+0.15 0.0 0.04
+
+0.10 0.0 0.02
+
+檔案覆蓋
+
+docker cp 429c4226800a:/root/ws/manual_guided_arm.py ./manual_guided_arm.py
+
+ 429c4226800a 是你的容器 ID。
+
+/root/ws/manual_guided_arm.py 是檔案在裡面的完整路徑。
+
+./manual_guided_arm.py 是要把檔案存在你電腦現在的位置。
+
+
+把改好的檔案「塞」回去
+
+docker cp ./manual_guided_arm.py 429c4226800a:/root/ws/manual_guided_arm.py
+
+
+
+
+python檔案室可運行 但可能座標不對算不出來    打算用他給的範例+硬體端的條件 叫他在重新生一個出來 
+例如: 現在用此範例修改成可以手動輸入座標 並計算出來然後把計算出來的角度印在powershell上  而且要跟rviz的手臂也要模擬移移動到到我輸入到座標
+
+
+我現在要手動輸入座標，並且來計算IK值並把結果顯示在Powershell上並輸出，但同時也要在RVIZ上讓機械手臂移動到座標上 這是輸出的格式需求
